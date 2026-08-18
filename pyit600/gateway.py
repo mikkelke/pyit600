@@ -58,6 +58,7 @@ class IT600Gateway:
             port: int = 80,
             request_timeout: int = 5,
         poll_coalesce_seconds: float = 10.0,
+        write_confirm_seconds: float = 6.0,
             session: aiohttp.client.ClientSession = None,
             debug: bool = False,
     ):
@@ -70,6 +71,7 @@ class IT600Gateway:
         self._poll_lock = asyncio.Lock()
         self._last_poll_finished_at: Optional[float] = None
         self._poll_coalesce_seconds = poll_coalesce_seconds
+        self._write_confirm_seconds = write_confirm_seconds
 
         """Initialize connection with the iT600 gateway."""
         self._session = session
@@ -812,18 +814,7 @@ class IT600Gateway:
         else:
             request_data = { "sIT600TH": { "SetHoldType": 7 if preset == PRESET_OFF else 2 if preset == PRESET_PERMANENT_HOLD else 0 } }
 
-        await self._make_encrypted_request(
-            "write",
-            {
-                "requestAttr": "write",
-                "id": [
-                    {
-                        "data": device.data,
-                        **request_data,
-                    }
-                ],
-            },
-        )
+        await self._write_and_confirm(device, request_data)
 
     async def set_climate_device_mode(self, device_id: str, mode: str) -> None:
         """Public method for setting the hvac mode."""
@@ -839,18 +830,7 @@ class IT600Gateway:
         else:
             request_data = { "sIT600TH": { "SetHoldType": 7 if mode == HVAC_MODE_OFF else 0 } }
 
-        await self._make_encrypted_request(
-            "write",
-            {
-                "requestAttr": "write",
-                "id": [
-                    {
-                        "data": device.data,
-                        **request_data,
-                    }
-                ],
-            },
-        )
+        await self._write_and_confirm(device, request_data)
 
     async def set_climate_device_fan_mode(self, device_id: str, mode: str) -> None:
         """Public method for setting the hvac fan mode."""
@@ -863,18 +843,7 @@ class IT600Gateway:
 
         request_data = { "sFanS": { "FanMode": 5 if mode == FAN_MODE_AUTO else 3 if mode == FAN_MODE_HIGH else 2 if mode == FAN_MODE_MID else 1 if mode == FAN_MODE_LOW else 0 } }
 
-        await self._make_encrypted_request(
-            "write",
-            {
-                "requestAttr": "write",
-                "id": [
-                    {
-                        "data": device.data,
-                        **request_data,
-                    }
-                ],
-            },
-        )
+        await self._write_and_confirm(device, request_data)
 
     async def set_climate_device_locked(self, device_id: str, locked: bool) -> None:
         """Public method for setting the hvac locked status."""
@@ -893,18 +862,7 @@ class IT600Gateway:
             _LOGGER.error("Cannot set locked status: device %s has no known lock section", device_id)
             return
 
-        await self._make_encrypted_request(
-            "write",
-            {
-                "requestAttr": "write",
-                "id": [
-                    {
-                        "data": device.data,
-                        **request_data,
-                    }
-                ],
-            },
-        )
+        await self._write_and_confirm(device, request_data)
 
     async def set_climate_device_temperature(self, device_id: str, setpoint_celsius: float) -> None:
         """Public method for setting the temperature."""
@@ -923,18 +881,7 @@ class IT600Gateway:
         else:
           request_data = { "sIT600TH": { "SetHeatingSetpoint_x100": int(self.round_to_half(setpoint_celsius) * 100) } }
 
-        await self._make_encrypted_request(
-            "write",
-            {
-                "requestAttr": "write",
-                "id": [
-                    {
-                        "data": device.data,
-                        **request_data,
-                    }
-                ],
-            },
-        )
+        await self._write_and_confirm(device, request_data)
 
     @staticmethod
     def round_to_half(number: float) -> float:
@@ -966,6 +913,77 @@ class IT600Gateway:
         """Public method to add a sensor callback subscriber."""
 
         self._sensor_update_callbacks.append(method)
+
+    async def _write_and_confirm(self, device, request_data: dict) -> None:
+        """Write to a device, then wait until the gateway actually reports it.
+
+        The gateway ACKNOWLEDGES a write instantly but applies it asynchronously:
+        measured on an SQ610RFNH, a setpoint write returned in 0.01 s while readall
+        kept reporting the OLD value for ~2 s. Home Assistant refreshes within
+        milliseconds of the write returning, so it read the stale value, cached it,
+        and the entity showed the user's own change as not-applied until the next
+        30 s poll. That is the whole "setpoint lag" - not the radio, not the device.
+
+        So: write, then re-read until every written attribute is reflected (a write
+        attribute maps to its read attribute by dropping a leading "Set" -
+        SetHeatingSetpoint_x100 -> HeatingSetpoint_x100, SetLockKey -> LockKey), then
+        refresh the caches once so the caller's follow-up refresh - which our own poll
+        coalescing will serve from cache - already holds the new value.
+
+        Best-effort by design: the write itself has already happened, so a confirm
+        that times out or errors is logged and swallowed rather than raised. The
+        worst case is the pre-existing behaviour (entity catches up on the next poll).
+        """
+
+        await self._make_encrypted_request(
+            "write",
+            {
+                "requestAttr": "write",
+                "id": [
+                    {
+                        "data": device.data,
+                        **request_data,
+                    }
+                ],
+            },
+        )
+
+        expectations = {
+            (section, key[3:] if key.startswith("Set") else key): value
+            for section, attrs in request_data.items()
+            for key, value in attrs.items()
+        }
+        if not expectations or self._write_confirm_seconds <= 0:
+            return
+
+        try:
+            deadline = time.monotonic() + self._write_confirm_seconds
+            confirmed = False
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.4)
+                all_devices = await self._make_encrypted_request("read", {"requestAttr": "readall"})
+                status = next(
+                    (d for d in all_devices.get("id", []) if d.get("data") == device.data),
+                    None,
+                )
+                if status is None:
+                    continue
+                if all(
+                    status.get(section, {}).get(attr) == value
+                    for (section, attr), value in expectations.items()
+                ):
+                    confirmed = True
+                    break
+            if not confirmed:
+                _LOGGER.debug(
+                    "Write to %s not reflected by the gateway within %.1fs; the entity will "
+                    "catch up on the next poll", device.unique_id, self._write_confirm_seconds
+                )
+            # Refresh the caches from the post-write reality. poll_status() runs for real
+            # here because the write cleared the coalescing stamp.
+            await self.poll_status()
+        except BaseException as e:
+            _LOGGER.debug("Could not confirm write to %s: %s", device.unique_id, e)
 
     async def _make_encrypted_request(self, command: str, request_body: dict) -> Any:
         """Makes encrypted Salus iT600 json request, decrypts and returns response."""
