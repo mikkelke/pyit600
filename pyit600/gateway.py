@@ -519,6 +519,8 @@ class IT600Gateway:
                         if model is not None and "SQ610" in model:
                             current_humidity = th.get("SunnySetpoint_x100", None)  # Quantum thermostats store humidity there, other thermostats store there one of the setpoint temperatures
 
+                        lock_key = th.get("LockKey")  # Read LockKey, not the lagging acknowledged LockKey_a - same convention as HoldType vs HoldType_a
+
                         device = ClimateDevice(
                             **global_args,
                             current_humidity=current_humidity,
@@ -533,7 +535,8 @@ class IT600Gateway:
                             preset_modes=[PRESET_FOLLOW_SCHEDULE, PRESET_PERMANENT_HOLD, PRESET_OFF],
                             fan_mode=None,
                             fan_modes=None,
-                            locked=None,
+                            locked=None if lock_key is None else (lock_key == 1),
+                            lock_section="sIT600TH" if lock_key is not None else None,
                             supported_features=SUPPORT_TARGET_TEMPERATURE | SUPPORT_PRESET_MODE,
                         )
                     elif ther is not None and scomm is not None and sfans is not None:
@@ -555,6 +558,7 @@ class IT600Gateway:
                             fan_mode=FAN_MODE_OFF if fan_mode == 0 else FAN_MODE_HIGH if fan_mode == 3 else FAN_MODE_MEDIUM if fan_mode == 2 else FAN_MODE_LOW if fan_mode == 1 else FAN_MODE_AUTO, # fan_mode == 5 => FAN_MODE_AUTO
                             fan_modes=[FAN_MODE_AUTO, FAN_MODE_HIGH, FAN_MODE_MEDIUM, FAN_MODE_LOW, FAN_MODE_OFF],
                             locked=True if device_status.get("sTherUIS", {}).get("LockKey", 0) == 1 else False,
+                            lock_section="sTherUIS" if device_status.get("sTherUIS", {}).get("LockKey") is not None else None,
                             supported_features=SUPPORT_TARGET_TEMPERATURE | SUPPORT_PRESET_MODE | SUPPORT_FAN_MODE,
                         )
                     else:
@@ -843,7 +847,13 @@ class IT600Gateway:
             _LOGGER.error("Cannot set locked status: device not found with the specified id: %s", device_id)
             return
 
-        request_data = { "sTherUIS": { "LockKey": 1 if locked else 0 } }
+        if device.lock_section == "sIT600TH":
+            request_data = { "sIT600TH": { "SetLockKey": 1 if locked else 0 } }
+        elif device.lock_section == "sTherUIS":
+            request_data = { "sTherUIS": { "LockKey": 1 if locked else 0 } }
+        else:
+            _LOGGER.error("Cannot set locked status: device %s has no known lock section", device_id)
+            return
 
         await self._make_encrypted_request(
             "write",

@@ -41,6 +41,7 @@ class ClimateDevice(NamedTuple):
     rssi: Optional[int] = None
     lqi: Optional[int] = None
     errors: Optional[List[str]] = None
+    lock_section: Optional[str] = None
 
 
 class BinarySensorDevice(NamedTuple):
