@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Callable, Awaitable
 
 import aiohttp
@@ -56,6 +57,7 @@ class IT600Gateway:
             host: str,
             port: int = 80,
             request_timeout: int = 5,
+        poll_coalesce_seconds: float = 10.0,
             session: aiohttp.client.ClientSession = None,
             debug: bool = False,
     ):
@@ -65,6 +67,9 @@ class IT600Gateway:
         self._request_timeout = request_timeout
         self._debug = debug
         self._lock = asyncio.Lock()  # Gateway supports very few concurrent requests
+        self._poll_lock = asyncio.Lock()
+        self._last_poll_finished_at: Optional[float] = None
+        self._poll_coalesce_seconds = poll_coalesce_seconds
 
         """Initialize connection with the iT600 gateway."""
         self._session = session
@@ -133,7 +138,40 @@ class IT600Gateway:
             ) from ae
 
     async def poll_status(self, send_callback=False) -> None:
-        """Public method for polling the state of Salus iT600 devices."""
+        """Public method for polling the state of Salus iT600 devices.
+
+        Concurrent callers are COALESCED, not queued. The gateway serves very
+        few concurrent requests (hence self._lock), but serialising alone is
+        not enough: a Home Assistant install runs one coordinator per platform,
+        all created within milliseconds of each other and all on the same
+        interval, so every tick fires five full `readall` polls at once. Queued
+        behind the lock, the later ones then blow their caller's timeout and
+        surface as "Failed to poll climate devices" - observed live, and severe
+        enough that a boot-time occurrence left every entity unavailable.
+
+        So: if another caller finished a poll within poll_coalesce_seconds, we
+        return immediately and let them share that result - the caches this
+        method fills are process-wide, so the data is already there. A failed
+        poll does NOT update the stamp, so failures are never coalesced away
+        and every caller still sees the error it needs to mark entities
+        unavailable. send_callback bypasses coalescing, since callers asking to
+        be notified want a genuine refresh.
+        """
+
+        async with self._poll_lock:
+            if (
+                not send_callback
+                and self._last_poll_finished_at is not None
+                and self._poll_coalesce_seconds > 0
+                and (time.monotonic() - self._last_poll_finished_at) < self._poll_coalesce_seconds
+            ):
+                return
+
+            await self._poll_status_uncoalesced(send_callback)
+            self._last_poll_finished_at = time.monotonic()
+
+    async def _poll_status_uncoalesced(self, send_callback=False) -> None:
+        """The real poll. See poll_status for why callers are coalesced."""
 
         all_devices = await self._make_encrypted_request(
             "read",
