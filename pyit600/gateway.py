@@ -485,6 +485,17 @@ class IT600Gateway:
                     scomm = device_status.get("sComm", None)
                     sfans = device_status.get("sFanS", None)
 
+                    battery_level: Optional[int] = device_status.get("sIT600TH", {}).get("BatteryLevel", None)
+                    if battery_level is None:
+                        battery_level = device_status.get("sTherS", {}).get("BatteryLevel", None)
+
+                    errors: List[str] = sorted(
+                        key
+                        for section in (device_status.get("sIT600TH", {}), device_status.get("sIT600WC", {}))
+                        for key, value in section.items()
+                        if key.startswith("Error") and value
+                    )
+
                     global_args = {
                         "available": True if device_status.get("sZDOInfo", {}).get("OnlineStatus_i", 1) == 1 else False,
                         "name": json.loads(device_status.get("sZDO", {}).get("DeviceName", '{"deviceName": "Unknown"}'))["deviceName"],
@@ -496,6 +507,10 @@ class IT600Gateway:
                         "manufacturer": device_status.get("sBasicS", {}).get("ManufactureName", "SALUS"),
                         "model": model,
                         "sw_version": device_status.get("sZDO", {}).get("FirmwareVersion", None),
+                        "battery_level": battery_level,
+                        "rssi": device_status.get("sIT600I", {}).get("LastMessageRSSI_d", None),
+                        "lqi": device_status.get("sIT600I", {}).get("LastMessageLQI_d", None),
+                        "errors": errors,
                     }
 
                     if th is not None:

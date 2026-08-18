@@ -37,6 +37,10 @@ class ClimateDevice(NamedTuple):
     manufacturer: str
     model: Optional[str]
     sw_version: Optional[str]
+    battery_level: Optional[int] = None
+    rssi: Optional[int] = None
+    lqi: Optional[int] = None
+    errors: Optional[List[str]] = None
 
 
 class BinarySensorDevice(NamedTuple):
