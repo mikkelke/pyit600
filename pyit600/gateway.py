@@ -970,6 +970,15 @@ class IT600Gateway:
     async def _make_encrypted_request(self, command: str, request_body: dict) -> Any:
         """Makes encrypted Salus iT600 json request, decrypts and returns response."""
 
+        if command == "write":
+            # A write invalidates the poll-coalescing window. Every setter here is
+            # followed by the caller refreshing to show the new value, and that
+            # refresh would otherwise be coalesced into the pre-write snapshot -
+            # measured: setting a thermostat target to 17 still read 15 for ~30 s,
+            # i.e. the UI silently ignored the user's own command until the next
+            # poll. Coalescing is only ever safe between READS.
+            self._last_poll_finished_at = None
+
         async with self._lock:
             if self._session is None:
                 self._session = aiohttp.ClientSession()
