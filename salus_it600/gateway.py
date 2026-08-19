@@ -42,6 +42,9 @@ from .parsers import (
     parse_sensor_devices,
     parse_switch_sensor_devices,
     parse_switch_device,
+    parse_wiring_centre_binary_sensor_devices,
+    parse_wiring_centre_device,
+    parse_wiring_centre_sensor_devices,
 )
 from .encryptor import IT600Encryptor
 from .exceptions import (
@@ -405,6 +408,7 @@ class IT600Gateway:
         self._binary_sensor_devices: dict[str, BinarySensorDevice] = {}
         self._climate_binary_sensor_devices: dict[str, BinarySensorDevice] = {}
         self._binary_sensor_diagnostic_devices: dict[str, BinarySensorDevice] = {}
+        self._wiring_centre_binary_sensor_devices: dict[str, BinarySensorDevice] = {}
         self._binary_sensor_update_callbacks: list[UpdateCallback] = []
 
         self._switch_devices: dict[str, SwitchDevice] = {}
@@ -417,6 +421,7 @@ class IT600Gateway:
         self._climate_sensor_devices: dict[str, SensorDevice] = {}
         self._switch_sensor_devices: dict[str, SensorDevice] = {}
         self._meter_sensor_devices: dict[str, SensorDevice] = {}
+        self._wiring_centre_sensor_devices: dict[str, SensorDevice] = {}
         self._sensor_update_callbacks: list[UpdateCallback] = []
 
     async def connect(self) -> str:
@@ -583,6 +588,9 @@ class IT600Gateway:
             filter(lambda x: ("sIT600TH" in x) or ("sTherS" in x), device_items)
         )
         await self._refresh_climate_devices(climate_devices, send_callback)
+
+        wiring_centres = list(filter(lambda x: "sIT600WC" in x, device_items))
+        await self._refresh_wiring_centre_devices(wiring_centres, send_callback)
 
         binary_sensors = list(filter(is_binary_sensor_summary, device_items))
         await self._refresh_binary_sensor_devices(binary_sensors, send_callback)
@@ -925,6 +933,63 @@ class IT600Gateway:
         self._climate_binary_sensor_devices = binary_devices
         _LOGGER.debug("Refreshed %s climate devices", len(local_devices))
 
+    async def _refresh_wiring_centre_devices(
+        self,
+        devices: list[Any],
+        send_callback: bool = False,
+    ) -> None:
+        binary_devices: dict[str, BinarySensorDevice] = {}
+        sensor_devices: dict[str, SensorDevice] = {}
+
+        for device_status in await self._device_detail_statuses(
+            devices,
+            "wiring centre",
+        ):
+            unique_id = device_status.get("data", {}).get("UniID")
+            try:
+                connectivity = parse_wiring_centre_device(device_status)
+                problem_sensors = parse_wiring_centre_binary_sensor_devices(
+                    device_status,
+                )
+                signal_sensors = parse_wiring_centre_sensor_devices(device_status)
+            except PARSING_EXCEPTIONS:
+                _LOGGER.exception(
+                    "Failed to parse wiring centre device %s",
+                    unique_id,
+                )
+                continue
+
+            if connectivity is not None:
+                await self._store_refreshed_device(
+                    binary_devices,
+                    "_wiring_centre_binary_sensor_devices",
+                    self._send_binary_sensor_update_callback,
+                    connectivity,
+                    send_callback,
+                )
+
+            for problem_sensor in problem_sensors:
+                await self._store_refreshed_device(
+                    binary_devices,
+                    "_wiring_centre_binary_sensor_devices",
+                    self._send_binary_sensor_update_callback,
+                    problem_sensor,
+                    send_callback,
+                )
+
+            for signal_sensor in signal_sensors:
+                await self._store_refreshed_device(
+                    sensor_devices,
+                    "_wiring_centre_sensor_devices",
+                    self._send_sensor_update_callback,
+                    signal_sensor,
+                    send_callback,
+                )
+
+        self._wiring_centre_binary_sensor_devices = binary_devices
+        self._wiring_centre_sensor_devices = sensor_devices
+        _LOGGER.debug("Refreshed %s wiring centre devices", len(binary_devices))
+
     async def _send_climate_update_callback(self, device_id: str) -> None:
         """Internal method to notify all update callback subscribers."""
 
@@ -997,6 +1062,7 @@ class IT600Gateway:
             **self._binary_sensor_devices,
             **self._climate_binary_sensor_devices,
             **self._binary_sensor_diagnostic_devices,
+            **self._wiring_centre_binary_sensor_devices,
         }
 
     def get_binary_sensor_device(self, device_id: str) -> BinarySensorDevice | None:
@@ -1007,6 +1073,7 @@ class IT600Gateway:
             self._binary_sensor_devices.get(device_id)
             or self._climate_binary_sensor_devices.get(device_id)
             or self._binary_sensor_diagnostic_devices.get(device_id)
+            or self._wiring_centre_binary_sensor_devices.get(device_id)
         )
 
     def get_switch_devices(self) -> dict[str, SwitchDevice]:
@@ -1039,6 +1106,7 @@ class IT600Gateway:
             **self._climate_sensor_devices,
             **self._switch_sensor_devices,
             **self._meter_sensor_devices,
+            **self._wiring_centre_sensor_devices,
         }
 
     def get_sensor_device(self, device_id: str) -> SensorDevice | None:
@@ -1050,6 +1118,7 @@ class IT600Gateway:
             or self._climate_sensor_devices.get(device_id)
             or self._switch_sensor_devices.get(device_id)
             or self._meter_sensor_devices.get(device_id)
+            or self._wiring_centre_sensor_devices.get(device_id)
         )
 
     async def fetch_sq610_properties(
