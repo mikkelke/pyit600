@@ -54,6 +54,11 @@ class BinarySensorDevice(NamedTuple):
     manufacturer: str
     model: Optional[str]
     sw_version: Optional[str]
+    # Which HA device this entity belongs to. None means the entity is its own
+    # device (today's behaviour for every existing sensor); set both on every
+    # entity that should instead be grouped under one shared physical device.
+    device_unique_id: Optional[str] = None
+    device_name: Optional[str] = None
 
 
 class SwitchDevice(NamedTuple):

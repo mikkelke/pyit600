@@ -50,6 +50,23 @@ from .models import GatewayDevice, ClimateDevice, BinarySensorDevice, SwitchDevi
 
 _LOGGER = logging.getLogger("pyit600")
 
+
+def _is_fault_register_active(value: Any) -> bool:
+    """True if a sIT600WC/sIT600TH Error* register value indicates a fault.
+
+    Most of these registers are plain 0/1 ints, where bool(value) is correct.
+    ErrorCodeWC_d is different: a hex-string aggregate ("0000" at baseline),
+    and bool("0000") is True in Python since it is a non-empty string - that
+    would report a phantom fault on every healthy wiring centre. Stripping
+    leading/trailing "0" characters leaves an all-zero string empty (falsy)
+    while any string carrying a set bit keeps a non-zero character (truthy).
+    """
+
+    if isinstance(value, str):
+        return value.strip("0") != ""
+    return bool(value)
+
+
 class IT600Gateway:
     def __init__(
             self,
@@ -205,7 +222,7 @@ class IT600Gateway:
                 filter(lambda x: "sIASZS" in x or
                                  ("sBasicS" in x and
                                   "ModelIdentifier" in x["sBasicS"] and
-                                  x["sBasicS"]["ModelIdentifier"] in ["it600MINITRV", "it600Receiver"]), all_devices["id"])
+                                  x["sBasicS"]["ModelIdentifier"] in ["it600MINITRV", "it600Receiver", "it600WC"]), all_devices["id"])
             )
 
             await self._refresh_binary_sensor_devices(binary_sensors, send_callback)
@@ -460,6 +477,73 @@ class IT600Gateway:
 
                 try:
                     model: Optional[str] = device_status.get("DeviceL", {}).get("ModelIdentifier_i", None)
+
+                    if model == "it600WC":
+                        # The wiring centre ("Control Centre") has no valve/relay
+                        # state on the wire - its live record is fault registers
+                        # plus online status only (see ENHANCEMENT_PLAN.md). So it
+                        # yields two synthetic entries instead of the single device
+                        # every other branch here produces: a problem sensor and a
+                        # connectivity sensor. Both read defensively - a missing
+                        # section just means "no problem" / "not reachable", never
+                        # a KeyError.
+                        online_status = device_status.get("sZDOInfo", {}).get("OnlineStatus_i", 1)
+                        wc_section = device_status.get("sIT600WC", {}) or {}
+                        has_problem = any(
+                            _is_fault_register_active(value)
+                            for key, value in wc_section.items()
+                            if key.startswith("Error")
+                        )
+                        wc_name = json.loads(device_status.get("sZDO", {}).get("DeviceName", '{"deviceName": "Unknown"}'))["deviceName"]
+                        wc_manufacturer = device_status.get("sBasicS", {}).get("ManufactureName", "SALUS")
+                        wc_sw_version = device_status.get("sZDO", {}).get("FirmwareVersion", None)
+
+                        for device in (
+                            BinarySensorDevice(
+                                available=True if online_status == 1 else False,
+                                name=f"{wc_name} problem",
+                                unique_id=f"{unique_id}_problem",
+                                is_on=has_problem,
+                                device_class="problem",
+                                data=device_status["data"],
+                                manufacturer=wc_manufacturer,
+                                model=model,
+                                sw_version=wc_sw_version,
+                                # Both wiring centre entries share the SAME physical
+                                # device, unlike every other entry this method
+                                # produces (which are each their own device) - see
+                                # BinarySensorDevice.device_unique_id.
+                                device_unique_id=unique_id,
+                                device_name=wc_name,
+                            ),
+                            BinarySensorDevice(
+                                # Unconditionally available, unlike every other
+                                # entry produced by this method: a connectivity
+                                # sensor that itself goes unavailable exactly when
+                                # the device drops reports nothing at the only
+                                # moment it matters (same rule already applied to
+                                # the Tier 1 thermostat connectivity sensors).
+                                available=True,
+                                name=f"{wc_name} connectivity",
+                                unique_id=f"{unique_id}_connectivity",
+                                is_on=(online_status == 1),
+                                device_class="connectivity",
+                                data=device_status["data"],
+                                manufacturer=wc_manufacturer,
+                                model=model,
+                                sw_version=wc_sw_version,
+                                device_unique_id=unique_id,
+                                device_name=wc_name,
+                            ),
+                        ):
+                            local_devices[device.unique_id] = device
+
+                            if send_callback:
+                                self._binary_sensor_devices[device.unique_id] = device
+                                await self._send_binary_sensor_update_callback(device_id=device.unique_id)
+
+                        continue
+
                     if model in ["it600MINITRV", "it600Receiver"]:
                         is_on: Optional[bool] = device_status.get("sIT600I", {}).get("RelayStatus", None)
                     else:
